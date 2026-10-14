@@ -36,6 +36,10 @@ segments**, not one HTTP response held open for the entire query. Clients presen
 the segments as one logical Arrow batch reader and must still read the final
 control response to determine whether the query succeeded.
 
+**Scope boundary:** add Arrow as a result representation within Presto's
+existing HTTP query lifecycle. Do not introduce a separate query-long streaming
+service or recreate Flight's result-discovery, progress, and cancellation APIs.
+
 ## Background
 
 ### Motivating workload
@@ -107,6 +111,54 @@ mapping, page-to-Arrow conversion, memory-accounting rules, and conformance
 fixtures. This RFC does not supersede #63 or promise its future worker-parallel
 transport.
 
+The overlap from a more elaborate HTTP streaming design would primarily be with
+[Arrow Flight's data-delivery layer](https://arrow.apache.org/docs/format/Flight.html):
+schema/endpoint discovery, tickets, `DoGet`, progress polling, and cancellation.
+[Flight SQL](https://arrow.apache.org/docs/format/FlightSql.html) adds standardized
+SQL execution, prepared statements, and database metadata on top. Building
+equivalent capabilities in a custom HTTP service would retain the need for a
+Presto-specific client while duplicating much of that protocol work.
+
+This is not a claim that Flight makes server integration or recovery free.
+Either transport needs Presto query integration, authorization, resource
+accounting, and Arrow conversion; Flight does not by itself provide durable
+midstream resume or exactly-once application consumption. The boundary here is
+to reuse the existing HTTP result lifecycle, rather than define a parallel one.
+If a standardized query-long streaming service is needed, prefer collaborating
+on #63 instead of extending this RFC into a second such service.
+
+### Why bounded segments for the first implementation
+
+Presto already has result tokens, `nextUri`, and a cached last response for
+repeated token requests in [`Query`][query-source]. Attaching a bounded Arrow
+payload to that result entry follows the existing model. Each segment is itself
+a complete Arrow IPC stream; segmenting does not mean using a custom Arrow
+encoding or converting values back to JSON.
+
+For the motivating ML workload, the first objective is to deliver projected
+results as compressed columnar batches without client-side JSON-to-Arrow
+conversion. Bounded segments support incremental consumption before the query
+finishes; a query-long HTTP response is not required for that objective.
+
+Segments give payload ownership and replay an explicit boundary. A failed data
+GET can replay the retained segment before any of its batches are exposed, and
+a slow consumer can stop advancing `nextUri`. Correct retention, final status,
+memory accounting, and cleanup still require implementation; this is not just
+a serializer switch.
+
+A query-long response could reduce per-segment request and buffering overhead.
+Opening such a response is not inherently difficult, and a fail-on-disconnect
+contract could remain simple. Adding recovery after partial delivery and a
+separate status/progress lifecycle is where the design grows toward Flight.
+There is no benchmark evidence yet that avoiding segment boundaries justifies
+that additional scope for this workload.
+
+Start with bounded, multi-batch segments and measure their request overhead
+against conversion CPU, memory, and end-to-end consumption rate. Tune segment
+size before considering a different transport. A transport change would need
+separate justification and review alongside #63, not be an implicit next phase
+of this proposal.
+
 ### Goals
 
 * Eliminate row-oriented JSON and client-side row-to-Arrow rebuilding on the
@@ -123,6 +175,9 @@ transport.
 * Changing internal exchange serialization or adding direct worker downloads.
 * Distributed ADBC partitions, durable result spooling, cross-coordinator resume,
   or exactly-once application processing.
+* Query-long HTTP data responses, transparent midstream resume, or a separate
+  result-discovery/progress/cancellation service. Use existing HTTP query
+  control; evaluate broader streaming-service requirements with #63.
 * Bulk ingestion, replacing JSON, or replacing Flight SQL.
 * Supporting every Presto type in the first transport version through lossy
   implicit conversions.
@@ -151,6 +206,11 @@ The driver loads one bounded segment, validates it, and exposes its record
 batches. It follows `nextUri` only after consuming that segment. Fetching results
 is serial in version 1; asynchronous prefetch and parallel endpoints are not
 part of the contract.
+
+An HTTP segment may contain multiple Arrow record batches. Neither segment
+boundaries nor Arrow batch boundaries define a training minibatch; the
+application may combine or subdivide batches. Size segments for transport and
+memory efficiency rather than issuing one data GET per training minibatch.
 
 ### 2. Opt-in and compatibility
 
@@ -593,11 +653,11 @@ validation of declared compressed-buffer lengths before decompression.
 
 | Approach | Why not choose it for this RFC? |
 |---|---|
-| Flight SQL (#63) | Strong standard-client ecosystem and a partitioned endpoint model, but a separate gRPC service and lifecycle/auth adapter. Prefer it when those benefits outweigh the deployment cost; share conversion work. |
+| Flight SQL (#63) | Preferred direction when a standardized streaming service is needed. This RFC instead extends existing HTTP result pagination; share Arrow conversion and conformance work, not a second streaming-service protocol. |
 | Existing `binaryResults=true` | Avoids JSON value formatting, but retains base64 and Presto-specific decoding/conversion in clients. Useful as a benchmark, not a new public Arrow contract. |
 | Arrow bytes base64-encoded inside `QueryResults` | Simple envelope change, but adds base64 work and expansion; clients still parse a large JSON payload. |
 | Whole `/v1/statement` response negotiated as Arrow | Removes the extra data GET, but has no simple place for queued state, session updates, statistics, and errors after headers have been sent. |
-| One query-long HTTP Arrow stream | Fewer requests and lower first-batch buffering; reconnects, final errors, timeouts, and replay after partial delivery require a larger protocol. |
+| One query-long HTTP Arrow stream | Could reduce requests and first-batch buffering, but robust recovery and separate query control add scope overlapping Flight. A simple fail-on-disconnect stream is possible, but no measured benefit currently justifies changing the existing lifecycle. Not part of this RFC or an assumed follow-up phase. |
 | Multipart JSON + Arrow responses | Could save a round trip, but adds multipart framing/client work and makes retry boundaries less straightforward. |
 | JSON-to-Arrow sidecar | Works with unchanged servers but leaves server JSON serialization and client/gateway JSON parsing in the critical path. |
 | Worker-native Arrow immediately | Potentially reduces coordinator conversion cost, but changes distributed execution and serving. First establish correctness and measure whether coordinator conversion is the limiting factor. |
@@ -605,7 +665,9 @@ validation of declared compressed-buffer lengths before decompression.
 
 The chosen design adds a data GET and segment buffering. Those costs may matter
 for tiny results; JSON remains available. Larger bounded segments amortize the
-extra round trip at the cost of memory and latency.
+extra round trip at the cost of memory and latency. HTTP connections can be
+reused across segment requests; segmentation does not require a new connection
+or TLS handshake per batch.
 
 ## Adoption Plan
 
@@ -623,6 +685,11 @@ extra round trip at the cost of memory and latency.
    client examples. Pin the cross-language Arrow versions tested. Consider a
    future negotiated `auto` mode separately once safe compatibility behavior
    and schema expectations are established.
+
+The rollout delivers the bounded-segment path only; it does not require a
+second query-long HTTP implementation. Shared conversion/type-mapping fixtures
+should remain transport-independent so later Flight SQL work can reuse them
+without requiring this HTTP protocol to evolve into Flight.
 
 Disable the feature for **new submissions** to roll back; already accepted Arrow
 queries must either finish in Arrow mode or receive a clear cancellation/error.
@@ -690,7 +757,11 @@ Use the same queries, data, client host, concurrency, and execution engine for:
 4. Flight SQL if an implementation is available.
 
 Cover narrow/wide schemas, fixed/variable-width and nested data, small/large
-results, local/high-latency links, and slow/fast consumers. Report:
+results, local/high-latency links, and slow/fast consumers. Sweep segment byte
+targets and Arrow batch sizes independently, with HTTP connection reuse enabled.
+For the ML workload, measure time spent waiting for result requests versus
+conversion, dimension lookups, and training-data preparation before attributing
+an ingestion bottleneck to segmentation. Report:
 
 * Time to first application batch, total elapsed time, rows/s, and wire bytes.
 * Coordinator conversion/compression CPU, heap, off-heap memory, GC, and peak
@@ -698,6 +769,8 @@ results, local/high-latency links, and slow/fast consumers. Report:
 * Segment count/size, compression ratio, data GET latency, retry count,
   allocator/admission failures, cancellation/expiry cleanup time, and time
   blocked on consumers.
+* Per-segment control/data request overhead and buffering latency versus
+  conversion CPU and useful consumption time, to guide segment-size tuning.
 * Ordinary JSON-query throughput/latency under mixed Arrow and JSON load.
 
 Expose these through existing coordinator metrics/JMX using bounded labels
