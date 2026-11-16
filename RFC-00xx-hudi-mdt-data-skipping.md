@@ -19,7 +19,7 @@ Proposers
   * apache/hudi#16969 — push index scan down to workers
 * apache/hudi#18837 — RFC-105: Trino-Hudi connector moved into the Hudi repository, including MDT index support
 * apache/hudi#17042 — hanging Trino queries with column stats enabled (no repro yet)
-* Reference implementation: prestodb/presto#28781
+* Reference implementation: [prestodb/presto#28781](https://github.com/prestodb/presto/pull/28781)
 
 ## Summary
 
@@ -47,9 +47,9 @@ Presto has nothing comparable today:
   (`hive.hudi-metadata-enabled`), but it schedules a split for every listed file.
 * The `presto-hudi` connector's `HudiSplitManager` can also use the MDT for listing, but it
   does not read `column_stats`.
-* Pruning happens only after a split has been scheduled: Parquet footer and row-group
-  statistics in the reader. Opening each file still costs a coordinator split, a worker task
-  slot, and at least one footer read from object storage.
+* File-content pruning happens in the reader using Parquet footer and row-group statistics,
+  after splits have been scheduled. Each retained file still incurs split scheduling and
+  worker work, including a footer read from storage.
 
 The upstream Hudi epic for Presto and Trino (apache/hudi#15246, #16892) has made progress only
 for Trino. The Trino connector now lives in the Hudi repository (RFC-105, apache/hudi#18837)
@@ -61,15 +61,16 @@ highest-value, lowest-risk part: column-stats pruning for COW tables.
 For queries with selective filters on columns that are naturally clustered (event time, IDs,
 sequence numbers) or explicitly clustered by Hudi clustering, min/max pruning can remove a
 large fraction of files. Because the work happens before splits exist, the savings show up as
-fewer splits, less coordinator scheduling work, fewer worker task slots used, and fewer
+fewer splits, less coordinator scheduling work, less worker I/O, and fewer
 object-store requests.
 
 ### Goals
 
 * Prune Hudi COW Parquet files using MDT `column_stats`, with no false negatives: a file that
   contains a matching row is never pruned.
-* Never fail a query because of the optional index. A missing, building or unreadable index
-  means "no pruning", except for authorization failures and cancellation.
+* Recover from optional statistics lookup failures by retaining files. Authorization
+  failures, cancellation, VM errors and failures in the existing file-listing path still
+  propagate.
 * Make no changes to workers, splits, readers or the SPI, so the feature works with native
   execution.
 * Keep pruning logic connector-independent so the `presto-hudi` connector can adopt it.
@@ -90,12 +91,17 @@ object-store requests.
 
 | Module | Change |
 |---|---|
-| `presto-hudi-common` (new) | Connector-independent pruning: stats reader, stats → `Domain` conversion, evaluation, batching. Depends only on `presto-common` and the Hudi bundle. |
-| `presto-hive` | Passes the data-column predicate to `HudiDirectoryLister`, wraps its file iterator with a pruning iterator, and adds the config and session properties. |
+| `presto-hudi-common` (new) | Connector-independent stats reader, stats → `Domain` conversion, evaluation and lookup limits. Depends on `presto-common` and the Hudi bundle, with runtime Jackson for Avro schema parsing and `lz4-java` for MDT key hashing. |
+| `presto-hive` | Passes the data-column predicate to `HudiDirectoryLister`, batches and filters listed files in `HudiPruningIterator`, and adds the config and session properties. |
 | `presto-common` | Six new `RuntimeMetricName` constants. |
 | `presto-docs` | Hive connector documentation. |
 
 No changes are made to the SPI, `presto-main`, worker code, `presto-native-execution` or Velox.
+
+The upstream implementation targets Java 17 and the repository's existing
+`hudi-presto-bundle` 1.1.0 dependency. It does not upgrade Hudi. Results from an internal
+Hudi 1.2 build do not establish compatibility with the upstream dependency set; the tests
+below must run against 1.1.0.
 
 ### New configuration
 
@@ -125,31 +131,39 @@ public final class LatestHudiColumnStatsReader implements HudiColumnStatsReader 
 public final class HudiColumnStatsPruner
 {
     public static final int MAX_BATCH_SIZE = 128;   // files per MDT lookup
-    // At most 32 predicate columns; wider predicates disable pruning.
+    // At most 32 supported predicate columns; wider predicates disable pruning.
     public HudiColumnStatsPruner(TupleDomain<String> predicate, HudiColumnStatsReader reader);
     public boolean isUseful();                      // false if no supported column is constrained
     public Set<Pair<String, String>> retainFiles(List<Pair<String, String>> files) throws IOException;
 }
 
-final class HudiColumnStatsConverter { static Domain toDomain(Type type, HoodieMetadataColumnStats stats); }
-final class HudiStatisticsEvaluator  { static boolean mayMatch(TupleDomain<String> predicate, Map<String, Domain> fileDomains); }
+public final class HudiColumnStatsConverter { public static Domain toDomain(Type type, HoodieMetadataColumnStats stats); }
+public final class HudiStatisticsEvaluator  { public static boolean mayMatch(TupleDomain<String> predicate, Map<String, Domain> fileDomains); }
 ```
 
 **Statistics to Domain (soundness rules)**
 
-* If `min` and `max` are present, the domain is the range `[min, max]`. If `nullCount > 0`,
-  null is allowed. If `nullCount == valueCount`, the domain is `onlyNull`.
-* A missing bound, overflow, a deleted entry, duplicate entries for the same file and column,
-  or inconsistent counts produce `Domain.all(type)`, which never prunes.
-* The Hudi Avro schema type must match the Presto type exactly, with no coercions. A column
-  added, dropped or retyped by schema evolution is treated as unknown.
-* Phase 1 supports `BOOLEAN`, `INTEGER` and `BIGINT`. Other types produce `Domain.all`.
+* With valid counts and bounds, the domain is the inclusive range `[min, max]`, allowing null
+  when `nullCount > 0`. An all-null column produces `onlyNull` only when `valueCount > 0`
+  and both bounds are absent.
+* Missing bounds leave non-null values unconstrained. Valid null counts can still rule out
+  `IS NULL` or `IS NOT NULL`; missing bounds do not always mean `Domain.all`.
+* Overflow, reversed bounds, a deleted entry, duplicate entries for the same file and column,
+  nonpositive value counts or inconsistent statistics produce `Domain.all(type)`.
+* The reader requires the resolved Hudi Avro schema type to match the Presto type exactly,
+  with no coercions or logical types. Missing fields and type mismatches are unknown.
+  This check does not validate the schema history of each physical file.
+* The reader supports `BOOLEAN`, `INTEGER` and `BIGINT`. The converter also handles narrow
+  integer types, but the reader excludes them because they do not have an exact Avro match.
+  Other types cannot prune files in phase 1.
   `VARCHAR`, `DATE`, `TIMESTAMP` and `DECIMAL` are added once their statistics encodings and
   ordering are checked against Presto semantics. Strings especially need care: Hudi writes
   byte-wise min/max, which may be truncated.
 
-`mayMatch` returns false only when the intersection of the query domain and the file domain is
-empty for at least one predicate column.
+`mayMatch` returns false for `TupleDomain.none()`, or when the intersection of the query
+domain and the file domain is empty for at least one predicate column. Missing statistics
+for one column do not prevent another indexed column from ruling out the file. Row filters
+remain in place for every retained file.
 
 ### Code flow (Hive connector)
 
@@ -172,7 +186,7 @@ HiveSplitManager.getSplits
 HudiPruningIterator.computeNext
   take <= 128 files from the listing
   key each file as (path relative to the table, file name); non-.parquet or out-of-table files pass through
-  retained = pruner.retainFiles(keys)                  // one MDT getColumnStats call
+  retained = pruner.retainFiles(keys)                  // at most one MDT getColumnStats call
   emit retained files in original order, using the original HiveFileInfo objects
 ```
 
@@ -183,7 +197,8 @@ the index pays no MDT cost. An index still being built is not marked available.
 
 | Condition | Behaviour |
 |---|---|
-| No MDT, no `column_stats`, index building, no supported predicate column | No pruner and no lookups (zero overhead beyond the table-config check) |
+| No completed `column_stats` partition, or no useful predicate | No statistics lookups; existing file-listing behaviour is unchanged |
+| Column rejected by the schema check | No statistics lookup for that column; retain the file unless another column rules it out |
 | Recoverable lookup failure (`IOException`, `RuntimeException`, `LinkageError` such as a missing codec) | Keep the whole batch, disable pruning for the rest of the scan, log a warning once, and increment `hudiDataSkippingFallbacks` |
 | Authorization failure (`AccessControlException`, `AccessDeniedException`, `SecurityException`, `PERMISSION_DENIED`) | Fail with `PERMISSION_DENIED`. Silently ignoring it would hide misconfiguration and could mask policy |
 | Interruption / cancellation | Propagate |
@@ -200,15 +215,22 @@ later, once there is data to justify it.
 
 ### Snapshot consistency (known limitation of phase 1)
 
-`LatestHudiColumnStatsReader` reads the **latest** MDT state. It is not bound to the instant
-used for file listing. Because lookups use exact file names, a concurrent commit cannot
-attribute one file's statistics to a different file. A new file written after the listing is
-never looked up. What is not guaranteed in phase 1 is the case where a file listed at instant
-T has its statistics entry rewritten after T. In Hudi COW, a file name identifies immutable
-content (a file group ID plus a commit time), so that case should not arise. It is still
-documented as a limitation and not claimed as a guarantee. Phase 2 adds a snapshot-bound reader
-behind `HudiColumnStatsReader` that reads the MDT as of the listing instant, with no worker or
-split changes.
+`LatestHudiColumnStatsReader` reads the **latest** MDT state. It is not bound to the view used
+for file listing. Lookups use the exact relative partition path and file name, so statistics
+for a newly named file cannot be applied to an older listed file. A missing or deleted entry
+retains the file.
+
+That identity check relies on the COW convention that a file name identifies immutable
+content. It does not prove that the latest schema and statistics describe every older listed
+file after concurrent commits, rollback, cleaning, index rebuilding or schema evolution.
+Phase 1 neither reads statistics as of a captured instant nor detects all of these cases.
+The generated-data tests validate domain evaluation, not this end-to-end consistency claim.
+
+The no-false-negatives goal therefore still needs concurrent-writer and schema-evolution
+validation. The feature remains experimental and off by default. Phase 2 proposes a
+snapshot-bound reader behind `HudiColumnStatsReader`, with an explicit listing instant and
+fallback when compatible statistics are unavailable. That work requires coordinator-side
+integration but no worker or split-format changes.
 
 ### User-facing metrics
 
@@ -243,7 +265,7 @@ All metrics are recorded in the query's `RuntimeStats` on the coordinator, so th
    `hudi-presto-bundle`. Translating `TupleDomain` directly is simpler and keeps Presto's type
    semantics in Presto's hands.
 3. **Prune on workers** (apache/hudi#16969). This removes MDT access from the coordinator, but
-   a split and task are still spent on every file, and it would need worker changes in both
+   splits are still scheduled for every file, and it would need worker changes in both
    Java and Velox. Pruning on the coordinator before splits exist removes more work and changes
    less code.
 4. **Rely on Parquet footer and row-group statistics only.** This already happens, but only
@@ -261,8 +283,9 @@ All metrics are recorded in the query's `RuntimeStats` on the coordinator, so th
   parameter. These are not SPI classes.
 * **New configuration:** one config property and one session property, documented in
   `connector/hive.rst`.
-* **Rollout:** ship off by default, gather metrics from early adopters, then consider enabling
-  it by default once the snapshot-bound reader (phase 2) lands and more types are supported.
+* **Rollout:** keep phase 1 experimental and off by default. Validate the upstream dependency
+  set and concurrent-writer behaviour before recommending production use. Consider a default
+  change only after snapshot consistency is established and performance has been measured.
 * **Documentation:** a new *Hudi Copy-on-Write Data Skipping* section in the Hive connector
   docs, with a warning describing the snapshot limitation.
 * **Out of scope / future work:**
@@ -281,10 +304,11 @@ Unit tests:
 
 * `TestHudiColumnStatsConverter`: null counts, missing bounds, overflow, inconsistent
   statistics, unsupported types.
-* `TestHudiStatisticsEvaluator`: intersection semantics, missing columns, type mismatches.
-* `TestHudiColumnStatsPruner`: batch and column limits, `isUseful`, `TupleDomain.none`. It also
-  includes a deterministic generated-data soundness test: 500 files × 10 predicate forms, where
-  every file that contains a matching row must be retained.
+* `TestHudiStatisticsEvaluator`: intersection semantics, missing columns and type mismatches.
+  Its deterministic generated-data test covers 500 value sets × 10 predicate forms; a set
+  containing a matching value must not be rejected by the converter/evaluator.
+* `TestHudiColumnStatsPruner`: batch and column limits, `isUseful`, `TupleDomain.none`,
+  partition/file identity and propagation of lookup failures.
 * `TestHudiPruningIterator`: batching, order preservation, pass-through of ineligible files,
   fallback, permission and cancellation propagation, metrics.
 * `TestHudiDataColumnPredicate`: only top-level regular columns reach the pruner.
@@ -302,6 +326,19 @@ Integration-style tests:
 * Existing `TestHudiDirectoryLister`, `TestStoragePartitionLoader`,
   `TestBackgroundHiveSplitLoader` and `TestHiveClientConfig` tests are updated.
 
-No product-test changes are required for phase 1. A product test against a Spark-written Hudi
-table with `hoodie.metadata.index.column.stats.enable=true` would be a useful addition, and
-reviewers can suggest one if they want it.
+Upstream validation uses Java 17 and Hudi 1.1.0. Compile the Hive reactor and run the focused
+tests, including the existing directory-lister and loader coverage:
+
+```bash
+./mvnw install -B --no-transfer-progress -P ci -pl presto-hive -am \
+  -DskipUI -Dmaven.javadoc.skip=true \
+  '-Dtest=TestHudi*,TestHiveClientConfig,TestBackgroundHiveSplitLoader,TestStoragePartitionLoader' \
+  -Dsurefire.failIfNoSpecifiedTests=false -DfailIfNoTests=false
+```
+
+The real-MDT fixture is constructed by the test; it is not a Spark writer compatibility test.
+Before production rollout, add coverage using Spark-written tables with
+`hoodie.metadata.index.column.stats.enable=true`, concurrent commits and index maintenance,
+and schema evolution. Compare results with pruning disabled and enabled, including null
+predicates and both listing modes. Native execution also needs end-to-end validation even
+though no worker code changes are proposed.
